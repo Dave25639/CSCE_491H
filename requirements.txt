@@ -1,0 +1,15 @@
+aiohttp
+alive-progress
+backports.tarfile
+importlib-metadata
+ipykernel
+jaraco.collections
+openslide-bin
+openslide-python
+pip-chill
+requests
+tomli
+torchvision
+tqdm
+tzdata
+wsi-preprocessing
