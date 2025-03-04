@@ -10,10 +10,30 @@ from PIL import Image
 from tqdm import tqdm
 from torchvision.models import ResNet50_Weights
 import random
+from timm.models.vision_transformer import VisionTransformer
 
 from multiprocessing import set_start_method
 
-def create_average_embedding(base_dir, case_id, slide_name):
+def get_pretrained_url(key):
+    URL_PREFIX = "https://github.com/lunit-io/benchmark-ssl-pathology/releases/download/pretrained-weights"
+    model_zoo_registry = {
+        "DINO_p16": "dino_vit_small_patch16_ep200.torch",
+        "DINO_p8": "dino_vit_small_patch8_ep200.torch",
+    }
+    pretrained_url = f"{URL_PREFIX}/{model_zoo_registry.get(key)}"
+    return pretrained_url
+
+def vit_small(pretrained, progress, key, **kwargs):
+    patch_size = kwargs.get("patch_size", 16)
+    model = VisionTransformer(
+        img_size=224, patch_size=patch_size, embed_dim=384, num_heads=6, num_classes=0
+    )
+    if pretrained:
+        pretrained_url = get_pretrained_url(key)
+        model.load_state_dict(torch.hub.load_state_dict_from_url(pretrained_url, progress=progress))
+    return model
+
+def create_average_embedding(base_dir, case_id, slide_name, model_name="resnet50", num_tiles=200, model_key=None, patch_size=16):
     case_dir = os.path.join(base_dir, case_id)
     biospecimen_dir = os.path.join(case_dir, "Biospecimen")
     tiles_dir = os.path.join(biospecimen_dir, "Tiles")
@@ -34,28 +54,24 @@ def create_average_embedding(base_dir, case_id, slide_name):
         print(f"No valid tile CSV found for slide {slide_name} in case {case_id}.")
         return
     
-    # randomly select a subset of tiles for faster processing
     tile_df = pd.read_csv(tile_csv_path)
     tile_paths = tile_df['tile_path'].dropna().tolist()
-    tile_paths = random.sample(tile_paths, min(200, len(tile_paths)))
+    
+    # Subsample tiles based on user input (either a percentage or a fixed number)
+    tile_paths = random.sample(tile_paths, min(num_tiles, len(tile_paths)))
 
     if len(tile_paths) == 0:
         print(f"No tiles found in {tile_csv_path}.")
         return
     
-    # Load pre-trained ResNet model
+    # Load the chosen model
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    resnet = models.resnet50(weights=ResNet50_Weights.DEFAULT)
-    resnet.fc = nn.Identity()  # Remove classification head to extract embeddings
-    resnet = resnet.to(device)
-    resnet.eval()
+    model = load_model(model_name, model_key, patch_size)
+    model = model.to(device)
+    model.eval()
 
     # Image preprocessing pipeline
-    preprocess = transforms.Compose([
-        transforms.Resize((224, 224)),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-    ])
+    preprocess = get_preprocessing_pipeline(model_name)
 
     # Calculate embeddings for all tiles
     embeddings = []
@@ -65,8 +81,8 @@ def create_average_embedding(base_dir, case_id, slide_name):
             image = Image.open(tile_full_path).convert('RGB')
             input_tensor = preprocess(image).unsqueeze(0).to(device)  # Add batch dimension
             
-            with torch.no_grad():
-                embedding = resnet(input_tensor).squeeze(0)  # Remove batch dimension
+            with torch.no_grad(): 
+                embedding = model(input_tensor).squeeze(0)  # Remove batch dimension
             embeddings.append(embedding)
         except Exception as e:
             print(f"Error processing tile {tile_path} in case {case_id}: {e}")
@@ -78,10 +94,53 @@ def create_average_embedding(base_dir, case_id, slide_name):
         print(f"No embeddings generated for slide {slide_name} in case {case_id}.")
         return
     
-    print(f"Average embedding for slide {slide_name} in case {case_id}: {avg_embedding}")
+    #print(f"Average embedding for slide {slide_name} in case {case_id}: {avg_embedding}")
     return avg_embedding
 
-def create_WSI_embeddings(base_dir="cases"):
+def load_model(model_name, model_key=None, patch_size=None):
+    """Load the specified pre-trained model."""
+    if model_name == "resnet50":
+        # Load pre-trained ResNet model
+        model = models.resnet50(weights=models.ResNet50_Weights.DEFAULT)
+        model.fc = nn.Identity()  # Remove classification head to extract embeddings
+        preprocess = transforms.Compose([
+            transforms.Resize((224, 224)),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        ])
+    elif model_name == "vit_DINO":
+        # Load ViT model with DINO weights
+        model = vit_small(pretrained=True, progress=False, key=model_key, patch_size=patch_size)
+        preprocess = transforms.Compose([
+            transforms.Resize((224, 224)),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])  # ViT often uses different normalization
+        ])
+    else:
+        raise ValueError(f"Model '{model_name}' is not supported.")
+    
+    return model
+
+def get_preprocessing_pipeline(model_name):
+    """Return the appropriate preprocessing pipeline for the selected model."""
+    if model_name == "resnet50":
+        preprocess = transforms.Compose([
+            transforms.Resize((224, 224)),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        ])
+    elif model_name == "vit_DINO":
+        preprocess = transforms.Compose([
+            transforms.Resize((224, 224)),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        ])
+    else:
+        raise ValueError(f"Preprocessing for '{model_name}' not defined.")
+    
+    return preprocess
+
+def create_WSI_embeddings(base_dir, model_name, num_tiles):
     case_dirs = [d for d in os.listdir(base_dir) if os.path.isdir(os.path.join(base_dir, d))]
 
     for case_id in case_dirs:
@@ -103,12 +162,16 @@ def create_WSI_embeddings(base_dir="cases"):
             if sample['sample_type'] == "Primary Tumor":
                 for slide in sample.get('slides', []):
                     image_name = slide['image_file_name']
-                    embedding = create_average_embedding(base_dir, case_id, image_name)
-                    slide['embedding'] = embedding
+                    embedding = create_average_embedding(base_dir, case_id, image_name, model_name=model_name, num_tiles=num_tiles, model_key="DINO_p16")
+                    embedding_field_name = f"embedding_{model_name}"
+                    slide[embedding_field_name] = embedding
+                    slide.pop("embedding", None)
         
         with open(metadata_path, 'w') as f:
             json.dump(case_metadata, f, indent=4)
         print(f"Embeddings added for case {case_id} in the metadata.")
+
+def create_methylation_embeddings(base_dir):
 
 
 
@@ -252,6 +315,10 @@ def preprocess_WSI_slides(base_dir="cases", hard_reset=False):
         print(f"Processing complete for case {case_id}")
 
 if __name__=='__main__':
-  set_start_method("spawn")
-  preprocess_WSI_slides("cases")
-  create_WSI_embeddings("cases") 
+    set_start_method("spawn")
+    preprocess_WSI_slides("cases")
+    #create_WSI_embeddings("cases", "vit_DINO", 200)
+    #create_WSI_embeddings("cases", "resnet50", 200)
+    create_methylation_embeddings("cases")
+
+   
